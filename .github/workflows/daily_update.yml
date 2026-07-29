@@ -1,0 +1,30 @@
+name: Daily Watchlist Updater
+
+on:
+  schedule:
+    # Runs at 3:00 AM UTC every day
+    - cron: '0 3 * * *'
+  workflow_dispatch: # Allows you to click a "Run Now" button to test it!
+
+jobs:
+  update-db:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+          
+      - name: Run Daily Worker
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TMDB_TOKEN: ${{ secrets.TMDB_TOKEN }}
+        run: python daily_worker.py
