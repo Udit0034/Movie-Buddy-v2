@@ -1,0 +1,6 @@
+streamlit
+pandas
+supabase
+scikit-learn
+requests
+urllib3
