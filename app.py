@@ -106,6 +106,8 @@ def init_session():
         "active_filter": "All",
         "seen_media": set(),
         "rec_cache": None,            # cache recommendations for session
+        "dismissed_notifs": set(),    # cache hidden notifications
+        "tracked_ids": None           # cache user's watched/tracked ids to filter out of discovery
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -347,6 +349,39 @@ def get_recommendations(user_id):
     st.session_state.rec_cache = df
     return df
 
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_notifications(friend_id, limit=25):
+    """Fetches the most recent interactions from the friend for the Notification Center."""
+    if not friend_id:
+        return pd.DataFrame()
+    try:
+        res = supabase.table("interactions").select("media_id, status, rating, created_at").eq("user_id", friend_id).order("created_at", desc=True).limit(limit).execute()
+        if not res.data:
+            return pd.DataFrame()
+        
+        recent_items = res.data
+        media_ids = [item['media_id'] for item in recent_items]
+        
+        media_res = supabase.table("media").select("tmdb_id, title, poster_path").in_("tmdb_id", media_ids).execute()
+        media_dict = {m['tmdb_id']: m for m in (media_res.data or [])}
+        
+        notifications = []
+        for item in recent_items:
+            m_info = media_dict.get(item['media_id'], {})
+            notifications.append({
+                "tmdb_id": item['media_id'],
+                "title": m_info.get("title", "Unknown Title"),
+                "poster_path": m_info.get("poster_path", ""),
+                "status": item.get("status"),
+                "rating": item.get("rating"),
+                "created_at": item.get("created_at")
+            })
+        return pd.DataFrame(notifications)
+    except Exception as e:
+        logger.warning("load_notifications failed: %s", e)
+        return pd.DataFrame()
+
 # --- NAVIGATION & TRACKING LOGIC ---
 def set_selected_movie(tmdb_id):
     if not st.session_state.history_stack or st.session_state.history_stack[-1] != tmdb_id:
@@ -372,6 +407,9 @@ def save_tracker_for_selected(tmdb_id, rating_value, status_value):
 
     try:
         add_user_movie_history(uid, tmdb_id, rating=rating_value, status=status_value)
+        # Add to cached tracker set to hide from Discover immediately
+        if st.session_state.tracked_ids is not None:
+            st.session_state.tracked_ids.add(tmdb_id)
     except Exception as e:
         logger.error("save_tracker_for_selected add_history failed: %s", e)
         st.error("Failed to save. Please try again.")
@@ -427,7 +465,7 @@ def add_to_playlist_dialog(tmdb_id):
 
     st.markdown("---")
     new_pl = st.text_input("Create New Playlist", placeholder="Name... (e.g. Action Night)")
-    if st.button("➕ Create & Add", use_container_width=True):
+    if st.button("➕ Create & Add", width="stretch"):
         if new_pl.strip():
             try:
                 ins = supabase.table("playlists").insert({"user_id": uid, "name": new_pl.strip()}).execute()
@@ -453,12 +491,14 @@ def login_signup_page():
                 with st.form("login_form"):
                     login_user_input = st.text_input("Username")
                     login_pass = st.text_input("Password", type="password")
-                    if st.form_submit_button("Login", use_container_width=True):
+                    if st.form_submit_button("Login", width="stretch"):
                         success, uid = login_user(login_user_input, login_pass)
                         if success:
                             st.session_state.logged_in = True
                             st.session_state.username = login_user_input
                             st.session_state.user_id = uid
+                            st.session_state.tracked_ids = None # Refresh tracker data
+                            st.session_state.dismissed_notifs = set()
                             st.rerun()
                         else:
                             st.error("Invalid credentials.")
@@ -468,12 +508,14 @@ def login_signup_page():
                     new_user = st.text_input("Choose a username")
                     new_pass = st.text_input("Choose a password (min 6 chars)", type="password")
                     dob = st.date_input("Date of Birth", value=datetime.now(UTC) - timedelta(days=365 * 25))
-                    if st.form_submit_button("Sign Up", use_container_width=True):
+                    if st.form_submit_button("Sign Up", width="stretch"):
                         ok, msg, uid = signup_user(new_user, new_pass, str(dob))
                         if ok:
                             st.session_state.logged_in = True
                             st.session_state.username = new_user
                             st.session_state.user_id = uid
+                            st.session_state.tracked_ids = None # Refresh tracker data
+                            st.session_state.dismissed_notifs = set()
                             st.rerun()
                         else:
                             st.error(msg)
@@ -485,7 +527,7 @@ def render_media_card(row, col, idx):
     fname = st.session_state.friend_name
 
     with col.container(border=True):
-        st.image(poster, use_container_width=True)
+        st.image(poster, width="stretch")
         st.markdown(
             f"<div class='title-card'>{row.get('title', 'Unknown')}</div>",
             unsafe_allow_html=True
@@ -505,15 +547,20 @@ def render_media_card(row, col, idx):
             st.markdown("<div style='height: 1.2em;'></div>", unsafe_allow_html=True)
 
         c1, c2 = st.columns([1, 1])
-        c1.button("👀", key=f"v_{tmdb_id}_{idx}", on_click=set_selected_movie, args=(tmdb_id,), use_container_width=True, help="Details")
-        if c2.button("➕", key=f"q_{tmdb_id}_{idx}", use_container_width=True, help="Add to Playlist"):
+        c1.button("👀", key=f"v_{tmdb_id}_{idx}", on_click=set_selected_movie, args=(tmdb_id,), width="stretch", help="Details")
+        if c2.button("➕", key=f"q_{tmdb_id}_{idx}", width="stretch", help="Add to Playlist"):
             if not st.session_state.logged_in:
                 st.toast("You must be logged in to save media.", icon="⚠️")
             else:
                 add_to_playlist_dialog(tmdb_id)
 
-def render_horizontal_row(title, df, fallback_category, limit=8):
+def render_horizontal_row(title, df, fallback_category, limit=8, exclude_tracked=True):
     df = sanitize_df(df)
+
+    # Filter out watched items if we are in Discovery mode
+    if exclude_tracked and st.session_state.tracked_ids is not None:
+        if not df.empty:
+            df = df[~df["tmdb_id"].isin(st.session_state.tracked_ids)]
 
     # Filter by language first, then decide if fallback is needed
     if st.session_state.active_filter != "All" and "original_language" in df.columns:
@@ -522,7 +569,13 @@ def render_horizontal_row(title, df, fallback_category, limit=8):
             df = df[df["original_language"] == target_lang]
 
     if len(df) < limit and fallback_category != "must_watch":
-        db_df = load_filtered_media(category=fallback_category, language=st.session_state.active_filter, limit=limit)
+        # Request more from DB to ensure enough fallback items after filtering
+        db_df = load_filtered_media(category=fallback_category, language=st.session_state.active_filter, limit=limit + 20)
+        
+        # Filter DB results against tracker too
+        if exclude_tracked and st.session_state.tracked_ids is not None:
+            db_df = db_df[~db_df["tmdb_id"].isin(st.session_state.tracked_ids)]
+            
         df = pd.concat([df, db_df]).drop_duplicates(subset=["tmdb_id"])
 
     if df.empty:
@@ -534,7 +587,7 @@ def render_horizontal_row(title, df, fallback_category, limit=8):
     with header_col:
         st.markdown(f"### {title}")
     with btn_col:
-        if st.button("View All ➡️", key=f"btn_{fallback_category}", use_container_width=True):
+        if st.button("View All ➡️", key=f"btn_{fallback_category}", width="stretch"):
             set_view(fallback_category)
 
     st.markdown("<hr style='margin: 0px; padding-bottom: 15px;'/>", unsafe_allow_html=True)
@@ -547,14 +600,19 @@ def render_horizontal_row(title, df, fallback_category, limit=8):
         for idx, (_, row) in enumerate(row_df.iterrows()):
             render_media_card(row, cols[idx % 4], f"{fallback_category}_{idx}")
 
-def render_full_grid(title, df):
+def render_full_grid(title, df, exclude_tracked=False):
     st.header(title)
     df = sanitize_df(df)
+    
+    if exclude_tracked and st.session_state.tracked_ids is not None:
+        if not df.empty:
+            df = df[~df["tmdb_id"].isin(st.session_state.tracked_ids)]
+            
     if st.session_state.active_filter != "All" and "original_language" in df.columns:
         if st.session_state.active_filter in LANG_CODE_MAP:
             df = df[df["original_language"] == LANG_CODE_MAP[st.session_state.active_filter]]
     if df.empty:
-        st.info("No media matches the current language filter in this category.")
+        st.info("No media matches the current filters.")
         return
 
     df = df.head(TOTAL_TO_SHOW).reset_index(drop=True)
@@ -573,13 +631,13 @@ def render_full_grid(title, df):
     st.markdown("---")
     pag_col1, pag_col2, pag_col3 = st.columns([1, 2, 1])
     with pag_col1:
-        if st.button("⬅️ Previous", use_container_width=True) and st.session_state.page > 1:
+        if st.button("⬅️ Previous", width="stretch") and st.session_state.page > 1:
             st.session_state.page -= 1
             st.rerun()
     with pag_col2:
         st.markdown(f"<div style='text-align:center;'>Page <b>{st.session_state.page}</b> of {total_pages}</div>", unsafe_allow_html=True)
     with pag_col3:
-        if st.button("Next ➡️", use_container_width=True) and st.session_state.page < total_pages:
+        if st.button("Next ➡️", width="stretch") and st.session_state.page < total_pages:
             st.session_state.page += 1
             st.rerun()
 
@@ -593,7 +651,7 @@ def show_details_pane(tmdb_id):
 
     left, right = st.columns([1, 2])
     with left:
-        st.image(poster, use_container_width=True)
+        st.image(poster, width="stretch")
 
     with right:
         st.markdown(f"## {movie.get('title')}")
@@ -619,14 +677,12 @@ def show_details_pane(tmdb_id):
                     st.session_state.search_type = "cast"
                     set_view("search_results")
 
-        # Overview moved directly under cast — no tracker interruption
         if movie.get('overview'):
             st.markdown(
                 f"<div style='font-size:1.05em; color:#ddd; margin-top:15px;'>{movie.get('overview')}</div>",
                 unsafe_allow_html=True
             )
 
-    # Tracker section below the fold — cleaner reading flow
     st.markdown("---")
     st.markdown("### 📝 Track This")
     with st.container(border=True):
@@ -656,7 +712,6 @@ def show_details_pane(tmdb_id):
         if st.button("Save to Tracker", key=f"save_{tmdb_id}", type="primary"):
             save_tracker_for_selected(tmdb_id, user_rating, actual_status)
 
-    # Similar titles
     st.markdown("---")
     st.markdown("### 🍿 More Like This")
     with st.spinner("Finding similar titles..."):
@@ -671,7 +726,7 @@ def render_tracker_mini_card(row, col, target_uid, idx_prefix):
     rating = int(row['rating']) if row.get('rating') and row['rating'] > 0 else 0
 
     with col.container(border=True):
-        st.image(poster, use_container_width=True)
+        st.image(poster, width="stretch")
         st.markdown(
             f"<div class='title-card'>{row.get('title', 'Unknown')}</div>",
             unsafe_allow_html=True
@@ -685,7 +740,68 @@ def render_tracker_mini_card(row, col, target_uid, idx_prefix):
             st.markdown("<div style='height: 1.5em;'></div>", unsafe_allow_html=True)
 
         unique_key = f"trk_{target_uid}_{row.get('tmdb_id')}_{idx_prefix}"
-        st.button("View", key=unique_key, on_click=set_selected_movie, args=(row.get('tmdb_id'),), use_container_width=True)
+        st.button("View", key=unique_key, on_click=set_selected_movie, args=(row.get('tmdb_id'),), width="stretch")
+
+
+# --- NOTIFICATION PAGE ---
+def dismiss_notification(unique_id):
+    st.session_state.dismissed_notifs.add(unique_id)
+
+def notifications_page():
+    fname = st.session_state.friend_name
+    friend_id, _ = get_cached_friend_id()
+    
+    st.header(f"🔔 Activity from {fname}")
+    
+    if not friend_id:
+        st.info("You don't have a friend linked to your account yet.")
+        return
+        
+    with st.spinner("Checking for recent updates..."):
+        df = load_notifications(friend_id)
+        
+    if df.empty:
+        st.info(f"No recent activity from {fname} to show right now.")
+        return
+        
+    # Filter out notifications that were dismissed this session
+    df = df[~df.apply(lambda r: f"{r['tmdb_id']}_{r['created_at']}" in st.session_state.dismissed_notifs, axis=1)]
+
+    if df.empty:
+        st.info("You are all caught up! No new notifications.")
+        return
+        
+    for idx, row in df.iterrows():
+        poster = f"https://image.tmdb.org/t/p/w200{row.get('poster_path')}" if row.get('poster_path') else PLACEHOLDER_POSTER
+        status = row.get("status")
+        rating = row.get("rating")
+        title = row.get("title")
+        
+        # Unique ID combining movie and the timestamp to hide specific updates
+        notif_id = f"{row['tmdb_id']}_{row['created_at']}"
+        
+        action_text = "interacted with"
+        if status == "plan_to_watch":
+            action_text = f"wants to watch **{title}**"
+        elif status == "watching":
+            action_text = f"is currently watching **{title}**"
+        elif status == "completed":
+            stars = ("⭐" * int(rating)) if rating and rating > 0 else ""
+            action_text = f"finished **{title}** {stars}"
+        elif status == "dropped":
+            action_text = f"dropped **{title}**"
+            
+        with st.container(border=True):
+            col1, col2, col3 = st.columns([1.5, 9.5, 1])
+            with col1:
+                st.image(poster, width="stretch")
+            with col2:
+                st.markdown(f"**{fname}** {action_text}")
+                btn_key = f"notif_view_{row['tmdb_id']}_{idx}"
+                st.button("View Details", key=btn_key, on_click=set_selected_movie, args=(row['tmdb_id'],), width="content")
+            with col3:
+                del_btn_key = f"notif_del_{row['tmdb_id']}_{idx}"
+                st.button("❌", key=del_btn_key, on_click=dismiss_notification, args=(notif_id,), width="content", help="Dismiss Notification")
 
 # --- TRACKER PAGE ---
 def tracker_page():
@@ -791,7 +907,8 @@ def genre_page():
         selected_id = list(TMDB_GENRES.keys())[list(TMDB_GENRES.values()).index(selected_name)]
         with st.spinner(f"Loading {selected_name}..."):
             df = load_movies_by_genre(selected_id)
-        render_full_grid(f"Genre: {selected_name}", df)
+        # Pass exclude_tracked=True so you don't browse what you've already seen 
+        render_full_grid(f"Genre: {selected_name}", df, exclude_tracked=True)
 
 # --- MAIN APP ROUTER ---
 def main():
@@ -802,18 +919,25 @@ def main():
     # Hydrate friend info once per session
     if st.session_state.friend_id_cache is None:
         get_cached_friend_id()
+        
+    # Preload the user's tracker ids once per session so they get filtered from Discover Hub
+    if st.session_state.tracked_ids is None:
+        my_tracker = get_tracker_data(st.session_state.user_id)
+        st.session_state.tracked_ids = set(my_tracker['tmdb_id'].tolist()) if not my_tracker.empty else set()
 
     fname = st.session_state.friend_name
 
     with st.sidebar:
         st.title(f"👋 {st.session_state.username}")
-        if st.button("🏠 Discover Hub", use_container_width=True, type="primary"):
+        if st.button("🏠 Discover Hub", width="stretch", type="primary"):
             set_view("home")
-        if st.button("🎭 Browse Genres", use_container_width=True):
+        if st.button("🔔 Notifications", width="stretch"):
+            set_view("notifications")
+        if st.button("🎭 Browse Genres", width="stretch"):
             set_view("genre")
-        if st.button("🗓️ Upcoming Releases", use_container_width=True):
+        if st.button("🗓️ Upcoming Releases", width="stretch"):
             set_view("upcoming")
-        if st.button("📋 Shared Tracker", use_container_width=True):
+        if st.button("📋 Shared Tracker", width="stretch"):
             set_view("tracker")
 
         st.markdown("---")
@@ -824,7 +948,7 @@ def main():
             label_visibility="collapsed"
         )
         st.markdown("---")
-        if st.button("Logout", use_container_width=True):
+        if st.button("Logout", width="stretch"):
             st.session_state.clear()
             st.rerun()
 
@@ -840,7 +964,7 @@ def main():
                     placeholder="Search by title, cast, or director..."
                 )
             with c2:
-                if st.form_submit_button("Search", use_container_width=True):
+                if st.form_submit_button("Search", width="stretch"):
                     if query.strip():
                         st.session_state.search_query = query
                         st.session_state.search_type = "general"
@@ -872,53 +996,56 @@ def main():
 
         with st.spinner("Searching..."):
             results_df = load_movies_search(st.session_state.search_query, search_type=st.session_state.search_type)
-        render_full_grid(search_title, results_df)
+        render_full_grid(search_title, results_df, exclude_tracked=False) # Search shows everything
 
     elif st.session_state.view == "home":
         with st.spinner("Loading recommendations..."):
             rec_df = get_recommendations(st.session_state.user_id)
 
-        render_horizontal_row("🍿 Recommended Movies", rec_df[rec_df["media_type"] == "movie"], "movies")
+        # Passing exclude_tracked=True ensures previously watched items don't show up here
+        render_horizontal_row("🍿 Recommended Movies", rec_df[rec_df["media_type"] == "movie"], "movies", exclude_tracked=True)
         render_horizontal_row(
             "📺 Recommended Series",
             rec_df[(rec_df["media_type"] == "tv") & (~rec_df["original_language"].isin(["ja", "ko", "zh"]))],
-            "series"
+            "series", exclude_tracked=True
         )
         render_horizontal_row(
             "🌏 Recommended Dramas",
             rec_df[(rec_df["media_type"] == "tv") & (rec_df["original_language"].isin(["ko", "zh", "th", "tl", "es"]))],
-            "drama"
+            "drama", exclude_tracked=True
         )
         render_horizontal_row(
             "⚔️ Recommended Anime",
             rec_df[rec_df["original_language"] == "ja"],
-            "anime"
+            "anime", exclude_tracked=True
         )
-        render_horizontal_row(f"👑 {fname}'s Masterpieces", load_friend_must_watch(st.session_state.user_id), "must_watch")
-        render_horizontal_row("✨ Discover (Hidden Gems)", load_discover_media(), "discover")
-        render_horizontal_row("🗓️ Upcoming Releases", load_filtered_media("upcoming"), "upcoming")
+        render_horizontal_row(f"👑 {fname}'s Masterpieces", load_friend_must_watch(st.session_state.user_id), "must_watch", exclude_tracked=True)
+        render_horizontal_row("✨ Discover (Hidden Gems)", load_discover_media(), "discover", exclude_tracked=True)
+        render_horizontal_row("🗓️ Upcoming Releases", load_filtered_media("upcoming"), "upcoming", exclude_tracked=True)
 
+    elif st.session_state.view == "notifications":
+        notifications_page()
     elif st.session_state.view == "movies":
         with st.spinner("Loading movies..."):
-            render_full_grid("🍿 Movies", load_filtered_media("movies", language=st.session_state.active_filter))
+            render_full_grid("🍿 Movies", load_filtered_media("movies", language=st.session_state.active_filter), exclude_tracked=True)
     elif st.session_state.view == "series":
         with st.spinner("Loading series..."):
-            render_full_grid("📺 Series", load_filtered_media("series", language=st.session_state.active_filter))
+            render_full_grid("📺 Series", load_filtered_media("series", language=st.session_state.active_filter), exclude_tracked=True)
     elif st.session_state.view == "drama":
         with st.spinner("Loading dramas..."):
-            render_full_grid("🌏 Dramas", load_filtered_media("drama", language=st.session_state.active_filter))
+            render_full_grid("🌏 Dramas", load_filtered_media("drama", language=st.session_state.active_filter), exclude_tracked=True)
     elif st.session_state.view == "anime":
         with st.spinner("Loading anime..."):
-            render_full_grid("⚔️ Anime", load_filtered_media("anime", language=st.session_state.active_filter))
+            render_full_grid("⚔️ Anime", load_filtered_media("anime", language=st.session_state.active_filter), exclude_tracked=True)
     elif st.session_state.view == "discover":
         with st.spinner("Finding hidden gems..."):
-            render_full_grid("✨ Discover (Hidden Gems)", load_discover_media())
+            render_full_grid("✨ Discover (Hidden Gems)", load_discover_media(), exclude_tracked=True)
     elif st.session_state.view == "upcoming":
         with st.spinner("Loading upcoming releases..."):
-            render_full_grid("🗓️ Upcoming Releases", load_filtered_media("upcoming", language=st.session_state.active_filter))
+            render_full_grid("🗓️ Upcoming Releases", load_filtered_media("upcoming", language=st.session_state.active_filter), exclude_tracked=True)
     elif st.session_state.view == "must_watch":
         with st.spinner(f"Loading {fname}'s picks..."):
-            render_full_grid(f"👑 {fname}'s Masterpieces", load_friend_must_watch(st.session_state.user_id))
+            render_full_grid(f"👑 {fname}'s Masterpieces", load_friend_must_watch(st.session_state.user_id), exclude_tracked=True)
     elif st.session_state.view == "genre":
         genre_page()
     elif st.session_state.view == "tracker":
